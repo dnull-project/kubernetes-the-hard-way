@@ -1,0 +1,12 @@
+role_kthw:
+  local_path: "/root/kthw"
+  gcp: false
+  steps:
+    01: false
+    02: false
+    03: false
+    04: true
+  version:
+    cfssl: 1.4.1
+    kubectl: 1.21.0
+  kubernetes_hostnames: "kubernetes,kubernetes.default,kubernetes.default.svc,kubernetes.default.svc.cluster,kubernetes.svc.cluster.local"

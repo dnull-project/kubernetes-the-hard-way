@@ -1,0 +1,322 @@
+- block: # 01-create-dirs
+  - name: "Create {{ role_kthw.local_path }} on remote"
+    file:
+      path: "{{ role_kthw.local_path }}"
+      state: directory
+  when: role_kthw.steps.01
+
+- block: # 02-client-tools
+  # TODO: check if packages already installed
+  - name: "Install deps packages"
+    run_once: true
+    get_url:
+      url: "https://storage.googleapis.com/kubernetes-the-hard-way/cfssl/{{ role_kthw.version.cfssl }}/linux/{{ item }}"
+      dest: "/usr/local/bin/{{ item }}"
+      mode: '0770'
+    loop:
+      - cfssl
+      - cfssljson
+
+  - name: "Install kubectl"
+    get_url:
+      url: "https://storage.googleapis.com/kubernetes-release/release/v{{ role_kthw.version.kubectl }}/bin/linux/amd64/kubectl"
+      dest: "/usr/local/bin/{{ item }}"
+      mode: '0770'
+    loop:
+      - kubectl 
+  delegate_to: controller
+  when: role_kthw.steps.02
+
+
+- block: # 03-compute-resources
+  # TODO: rewrite into TF - let ansible run TF
+  - name: "GCP provision network"
+    shell: "{{ item }}"
+    loop:
+      - "gcloud compute networks create kubernetes-the-hard-way --subnet-mode custom"
+      - "gcloud compute networks subnets create kubernetes --network kubernetes-the-hard-way --range 10.240.0.0/24"
+      - "gcloud compute firewall-rules create kubernetes-the-hard-way-allow-internal --allow tcp,udp,icmp --network kubernetes-the-hard-way --source-ranges 10.240.0.0/24,10.200.0.0/16"
+      - "gcloud compute firewall-rules create kubernetes-the-hard-way-allow-external --allow tcp:22,tcp:6443,icmp --network kubernetes-the-hard-way --source-ranges 0.0.0.0/0"
+      - "gcloud compute firewall-rules list --filter='network:kubernetes-the-hard-way'"
+      - "gcloud compute addresses create kubernetes-the-hard-way --region $(gcloud config get-value compute/region)"
+    ignore_errors: yes
+    become: false
+  - name: "GCP create controller and worker"
+    shell: "gcloud compute instances create {{ item }} --async --boot-disk-size 200GB --can-ip-forward --image-family ubuntu-2004-lts --image-project ubuntu-os-cloud --machine-type e2-standard-2 --private-network-ip 10.240.0.11 --scopes compute-rw,storage-ro,service-management,service-control,logging-write,monitoring --subnet kubernetes --tags kubernetes-the-hard-way,{{ item }} && sleep 30"
+    loop:
+    - controller
+    - worker
+    ignore_errors: yes
+    become: false
+  - name: "GCP create controller and worker"
+    shell: "gcloud compute instances list --filter='tags.items=kubernetes-the-hard-way'"
+    become: false
+  delegate_to: localhost 
+  when: role_kthw.steps.03 and role_kthw.gcp 
+
+
+- block: # 04-certificate-authority
+  - name: "Create {{ role_kthw.local_path }}"
+    file:
+      path: "{{ role_kthw.local_path }}"
+      state: directory
+  - name: "Create CA"
+    copy:
+      dest: "{{ role_kthw.local_path }}/ca-config.json"
+      content: |
+        {
+          "signing": {
+            "default": {
+              "expiry": "8760h"
+            },
+            "profiles": {
+              "kubernetes": {
+                "usages": ["signing", "key encipherment", "server auth", "client auth"],
+                "expiry": "8760h"
+              }
+            }
+          }
+        }
+  - name: "Create CN"
+    copy:
+      dest: "{{ role_kthw.local_path }}/ca-csr.json"
+      content: |
+        {
+          "CN": "Kubernetes",
+          "key": {
+            "algo": "rsa",
+            "size": 2048
+          },
+          "names": [
+            {
+              "C": "US",
+              "L": "Portland",
+              "O": "Kubernetes",
+              "OU": "CA",
+              "ST": "Oregon"
+            }
+          ]
+        }
+  - stat: path="{{ role_kthw.local_path }}/ca.pem"
+    register: ca_pem
+  - name: "Generate CA"
+    shell: "cfssl gencert -initca ca-csr.json | cfssljson -bare ca"
+    args:
+      chdir: "{{ role_kthw.local_path }}"
+    when: ca_pem.stat.exists == false
+  - name: "Create Admin certificate"
+    copy:
+      dest: "{{ role_kthw.local_path }}/admin-csr.json"
+      content: |
+        {
+          "CN": "admin",
+          "key": {
+            "algo": "rsa",
+            "size": 2048
+          },
+          "names": [
+            {
+              "C": "US",
+              "L": "Portland",
+              "O": "system:masters",
+              "OU": "Kubernetes The Hard Way",
+              "ST": "Oregon"
+            }
+          ]
+        }
+  - stat: path="{{ role_kthw.local_path }}/admin.pem"
+    register: admin_pem
+  - name: "Generate CA"
+    shell: "cfssl gencert -ca=ca.pem -ca-key=ca-key.pem -config=ca-config.json -profile=kubernetes admin-csr.json | cfssljson -bare admin"
+    args:
+      chdir: "{{ role_kthw.local_path }}"
+    when: admin_pem.stat.exists == false
+  - name: "Create worker node cert"
+    copy:
+      dest: "{{ role_kthw.local_path }}/worker-csr.json"
+      content: |
+        {
+          "CN": "system:node:worker",
+          "key": {
+            "algo": "rsa",
+            "size": 2048
+          },
+          "names": [
+            {
+              "C": "US",
+              "L": "Portland",
+              "O": "system:nodes",
+              "OU": "Kubernetes The Hard Way",
+              "ST": "Oregon"
+            }
+          ]
+        }
+  - stat: path="{{ role_kthw.local_path }}/worker.pem"
+    register: worker_pem
+  - name: "Worker EXTERNAL_IP"
+    become: false
+    shell: "gcloud compute instances describe worker --format 'value(networkInterfaces[0].accessConfigs[0].natIP)'"
+    register: WORKER_EXTERNAL_IP
+    when: worker_pem.stat.exists == false
+  - name: "Worker INTERNAL_IP"
+    become: false
+    shell: "gcloud compute instances describe worker --format 'value(networkInterfaces[0].networkIP)'"
+    register: WORKER_INTERNAL_IP
+    when: worker_pem.stat.exists == false
+  - name: "Generate Worker keys"
+    shell: "cfssl gencert -ca=ca.pem -ca-key=ca-key.pem -config=ca-config.json -hostname=worker,{{ WORKER_EXTERNAL_IP.stdout }},{{ WORKER_INTERNAL_IP.stdout }} -profile=kubernetes worker-csr.json | cfssljson -bare worker"
+    args:
+      chdir: "{{ role_kthw.local_path }}"
+    when: worker_pem.stat.exists == false
+  - stat: path="{{ role_kthw.local_path }}/kube-controller-manager.pem"
+    register: controller_pem
+  - name: "Create controller cert"
+    copy:
+      dest: "{{ role_kthw.local_path }}/kube-controller-manager-csr.json"
+      content: |
+        {
+          "CN": "system:kube-controller-manager",
+          "key": {
+            "algo": "rsa",
+            "size": 2048
+          },
+          "names": [
+            {
+              "C": "US",
+              "L": "Portland",
+              "O": "system:kube-controller-manager",
+              "OU": "Kubernetes The Hard Way",
+              "ST": "Oregon"
+            }
+          ]
+        }
+  - name: "Generate Controller keys"
+    shell: "cfssl gencert -ca=ca.pem -ca-key=ca-key.pem -config=ca-config.json -profile=kubernetes kube-controller-manager-csr.json | cfssljson -bare kube-controller-manager"
+    args:
+      chdir: "{{ role_kthw.local_path }}"
+    when: controller_pem.stat.exists == false
+  - stat: path="{{ role_kthw.local_path }}/kube-proxy.pem"
+    register: proxy_pem
+  - name: "Create proxy cert"
+    copy:
+      dest: "{{ role_kthw.local_path }}/kube-proxy-csr.json"
+      content: |
+        {
+          "CN": "system:kube-proxy",
+          "key": {
+            "algo": "rsa",
+            "size": 2048
+          },
+          "names": [
+            {
+              "C": "US",
+              "L": "Portland",
+              "O": "system:node-proxier",
+              "OU": "Kubernetes The Hard Way",
+              "ST": "Oregon"
+            }
+          ]
+        }
+  - name: "Generate Proxy keys"
+    shell: "cfssl gencert -ca=ca.pem -ca-key=ca-key.pem -config=ca-config.json -profile=kubernetes kube-proxy-csr.json | cfssljson -bare kube-proxy"
+    args:
+      chdir: "{{ role_kthw.local_path }}"
+    when: proxy_pem.stat.exists == false
+  - stat: path="{{ role_kthw.local_path }}/kube-scheduler.pem"
+    register: scheduler_pem
+  - name: "Create Scheduler cert"
+    copy:
+      dest: "{{ role_kthw.local_path }}/kube-scheduler-csr.json"
+      content: |
+        {
+          "CN": "system:kube-scheduler",
+          "key": {
+            "algo": "rsa",
+            "size": 2048
+          },
+          "names": [
+            {
+              "C": "US",
+              "L": "Portland",
+              "O": "system:kube-scheduler",
+              "OU": "Kubernetes The Hard Way",
+              "ST": "Oregon"
+            }
+          ]
+        }
+  - name: "Generate Scheduler keys"
+    shell: "cfssl gencert -ca=ca.pem -ca-key=ca-key.pem -config=ca-config.json -profile=kubernetes kube-scheduler-csr.json | cfssljson -bare kube-scheduler"
+    args:
+      chdir: "{{ role_kthw.local_path }}"
+    when: scheduler_pem.stat.exists == false
+  - stat: path="{{ role_kthw.local_path }}/kubernetes.pem"
+    register: kubernetes_pem
+  # TODO: use statis IP
+  # - shell: "gcloud compute addresses describe kubernetes-the-hard-way --region $(gcloud config get-value compute/region) --format 'value(address)'"
+  - shell: "gcloud compute instances describe controller --format 'value(networkInterfaces[0].accessConfigs[0].natIP)'"
+    become: false
+    register: KUBERNETES_PUBLIC_ADDRESS
+    when: kubernetes_pem.stat.exists == false
+  - name: "Create Kubernetes cert"
+    copy:
+      dest: "{{ role_kthw.local_path }}/kubernetes-csr.json"
+      content: |
+        {
+          "CN": "kubernetes",
+          "key": {
+            "algo": "rsa",
+            "size": 2048
+          },
+          "names": [
+            {
+              "C": "US",
+              "L": "Portland",
+              "O": "Kubernetes",
+              "OU": "Kubernetes The Hard Way",
+              "ST": "Oregon"
+            }
+          ]
+        }
+  - name: "Generate Scheduler keys"
+    shell: "cfssl gencert -ca=ca.pem -ca-key=ca-key.pem -config=ca-config.json -hostname=10.32.0.1,10.240.0.10,10.240.0.11,10.240.0.12,{{ KUBERNETES_PUBLIC_ADDRESS.stdout }},127.0.0.1,{{ role_kthw.kubernetes_hostnames }} -profile=kubernetes kubernetes-csr.json | cfssljson -bare kubernetes"
+    args:
+      chdir: "{{ role_kthw.local_path }}"
+    when: kubernetes_pem.stat.exists == false
+  - stat: path="{{ role_kthw.local_path }}/service-account.pem"
+    register: sa_pem
+  - name: "Create SA cert"
+    copy:
+      dest: "{{ role_kthw.local_path }}/service-account-csr.json"
+      content: |
+        {
+          "CN": "service-accounts",
+          "key": {
+            "algo": "rsa",
+            "size": 2048
+          },
+          "names": [
+            {
+              "C": "US",
+              "L": "Portland",
+              "O": "Kubernetes",
+              "OU": "Kubernetes The Hard Way",
+              "ST": "Oregon"
+            }
+          ]
+        }
+  - name: "Generate SA keys"
+    shell: "cfssl gencert -ca=ca.pem -ca-key=ca-key.pem -config=ca-config.json -profile=kubernetes service-account-csr.json | cfssljson -bare service-account"
+    args:
+      chdir: "{{ role_kthw.local_path }}"
+    when: sa_pem.stat.exists == false
+  run_once: true
+  delegate_to: localhost
+  when: role_kthw.steps.04
+- block: # 04-certificate-authority 2nd part
+  - name: "Copy to worker"
+    copy:
+      src:  "{{ role_kthw.local_path }}/{{ item }}"
+      dest: "{{ role_kthw.local_path }}/{{ item }}"
+    loop:
+      - ca.pem
+  when: role_kthw.steps.04
