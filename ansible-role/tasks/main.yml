@@ -314,12 +314,15 @@
   delegate_to: localhost
   when: role_kthw.steps.04 == true
 - block: # 04-certificate-authority 2nd part
-  - name: "Copy to worker and controller"
+  - name: "Copy pem to worker and controller"
     copy:
       src:  "{{ role_kthw.local_path }}/{{ item }}"
       dest: "{{ role_kthw.local_path }}/{{ item }}"
     loop:
       - ca.pem
+      - ca-key.pem
+      - kubernetes-key.pem
+      - kubernetes.pem 
       - worker-key.pem
       - worker.pem
       - service-account-key.pem
@@ -327,7 +330,7 @@
   when: role_kthw.steps.04 == true
 
 
-- block:
+- block: # 05-kubernetes-configuration-files
   - shell: "gcloud compute instances describe controller --format 'value(networkInterfaces[0].accessConfigs[0].natIP)'"
     become: false
     register: KUBERNETES_PUBLIC_ADDRESS
@@ -348,6 +351,7 @@
         --user=system:node:{{ item }} \
         --kubeconfig={{ item }}.kubeconfig
       kubectl config use-context default --kubeconfig={{ item }}.kubeconfig
+      chmod 644 *.kubeconfig
     args:
       chdir: "{{ role_kthw.local_path }}"
     loop:
@@ -359,3 +363,118 @@
   run_once: true
   delegate_to: localhost
   when: role_kthw.steps.05 == true
+- block: # 05-kubernetes-configuration-files 2nd part
+  - name: "Copy kubeconfig to worker and controller"
+    copy:
+      src:  "{{ role_kthw.local_path }}/{{ item }}"
+      dest: "{{ role_kthw.local_path }}/{{ item }}"
+    loop:
+      - worker.kubeconfig
+      - kube-proxy.kubeconfig
+      - admin.kubeconfig 
+      - kube-controller-manager.kubeconfig 
+      - kube-scheduler.kubeconfig
+  when: role_kthw.steps.05 == true
+
+
+- block: # 06-data-encryption-keys
+  - stat: path="{{ role_kthw.local_path }}/encryption.key"
+    register: encryption_key
+  - name: "Generate encryption key"
+    shell: "head -c 32 /dev/urandom | base64 > encryption.key"
+    args:
+      chdir: "{{ role_kthw.local_path }}"
+    when: encryption_key.stat.exists == false
+  - shell: "cat encryption.key"
+    register: ENCRYPTION_KEY
+    args:
+      chdir: "{{ role_kthw.local_path }}"
+  - stat: path="{{ role_kthw.local_path }}/encryption-config.yaml"
+    register: encryption_config
+  - name: "Create Encryption config"
+    copy:
+      dest: "{{ role_kthw.local_path }}/encryption-config.yaml"
+      content: |
+        kind: EncryptionConfig
+        apiVersion: v1
+        resources:
+          - resources:
+              - secrets
+            providers:
+              - aescbc:
+                  keys:
+                    - name: key1
+                      secret: {{ ENCRYPTION_KEY.stdout }}
+              - identity: {}
+  run_once: true
+  delegate_to: localhost
+  when: role_kthw.steps.06 == true
+- block: # 06-data-encryption-keys
+  - name: "Copy kubeconfig to worker and controller"
+    copy:
+      src:  "{{ role_kthw.local_path }}/{{ item }}"
+      dest: "{{ role_kthw.local_path }}/{{ item }}"
+    loop:
+      - encryption-config.yaml
+  when: role_kthw.steps.06 == true
+
+
+- block: # 07-bootstrapping-etcd
+  - name: "Download etcd"
+    get_url:
+      url: "https://github.com/etcd-io/etcd/releases/download/v{{ role_kthw.version.etcd }}/etcd-v{{ role_kthw.version.etcd }}-linux-amd64.tar.gz"
+      dest: "/tmp/etcd.tar.gz"
+  - name: "Install etcd"
+    shell: |
+      tar -xf /tmp/etcd.tar.gz -C /tmp/
+      mv /tmp/etcd*/etcd* /usr/local/bin/
+      mkdir -p /etc/etcd /var/lib/etcd
+      chmod 700 /var/lib/etcd
+      cp ca.pem kubernetes-key.pem kubernetes.pem /etc/etcd/
+    args:
+      chdir: "{{ role_kthw.local_path }}"
+  - shell: "curl -s -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/ip"
+    register: INTERNAL_IP
+  - shell: "hostname -s"
+    register: ETCD_NAME
+  - name: "Create etcd systemd unit"
+    copy:
+      dest: "/etc/systemd/system/etcd.service"
+      content: |
+        [Unit]
+        Description=etcd
+        Documentation=https://github.com/coreos
+        [Service]
+        Type=notify
+        ExecStart=/usr/local/bin/etcd \\
+          --name {{ETCD_NAME.stdout}} \\
+          --cert-file=/etc/etcd/kubernetes.pem \\
+          --key-file=/etc/etcd/kubernetes-key.pem \\
+          --peer-cert-file=/etc/etcd/kubernetes.pem \\
+          --peer-key-file=/etc/etcd/kubernetes-key.pem \\
+          --trusted-ca-file=/etc/etcd/ca.pem \\
+          --peer-trusted-ca-file=/etc/etcd/ca.pem \\
+          --peer-client-cert-auth \\
+          --client-cert-auth \\
+          --initial-advertise-peer-urls https://{{INTERNAL_IP.stdout}}:2380 \\
+          --listen-peer-urls https://{{INTERNAL_IP.stdout}}:2380 \\
+          --listen-client-urls https://{{INTERNAL_IP.stdout}}:2379,https://127.0.0.1:2379 \\
+          --advertise-client-urls https://{{INTERNAL_IP.stdout}}:2379 \\
+          --initial-cluster-token etcd-cluster-0 \\
+          --initial-cluster controller=https://{{INTERNAL_IP.stdout}}:2380 \\
+          --initial-cluster-state new \\
+          --data-dir=/var/lib/etcd
+        Restart=on-failure
+        RestartSec=5
+        [Install]
+        WantedBy=multi-user.target
+  - name: "Enable etcd"
+    systemd:
+      name: etcd
+      state: started
+      enabled: true
+      daemon-reload: true
+  run_once: true
+  delegate_to: controller
+  when: role_kthw.steps.07 == true
+

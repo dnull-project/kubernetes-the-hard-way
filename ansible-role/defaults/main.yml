@@ -5,9 +5,12 @@ role_kthw:
     01: false
     02: false
     03: false
-    04: false
-    05: true
+    04: true
+    05: false
+    06: false
+    07: true
   version:
     cfssl: 1.4.1
     kubectl: 1.21.0
+    etcd: 3.4.15
   kubernetes_hostnames: "kubernetes,kubernetes.default,kubernetes.default.svc,kubernetes.default.svc.cluster,kubernetes.svc.cluster.local"
